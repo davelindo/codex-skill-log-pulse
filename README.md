@@ -12,22 +12,21 @@ Reduce token usage for long-running tests/builds by logging full output to a fil
 
 ### Install via `$skill-installer` (recommended)
 
-Use the skill-installer script with the repo path (this is what the `$skill-installer` skill runs):
+Use the official `$skill-installer` command format:
+
+```bash
+$skill-installer install https://github.com/davelindo/codex-skill-log-pulse/tree/main/log-pulse
+```
+
+Restart Codex to pick up the new skill.
+
+### Alternate (script-based) install
 
 ```bash
 python3 ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py \
   --repo davelindo/codex-skill-log-pulse \
   --path log-pulse
 ```
-
-Alternative using a URL:
-
-```bash
-python3 ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-github.py \
-  --url https://github.com/davelindo/codex-skill-log-pulse/tree/main/log-pulse
-```
-
-Restart Codex to pick up the new skill.
 
 ## Build the .skill locally
 
