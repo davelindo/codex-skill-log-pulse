@@ -1,0 +1,35 @@
+name: build-skill
+
+on:
+  push:
+    paths:
+      - 'log-pulse/**'
+      - 'scripts/**'
+      - '.github/workflows/build-skill.yml'
+      - 'README.md'
+  workflow_dispatch:
+  release:
+    types: [created]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Install build deps
+        run: python -m pip install --upgrade pip pyyaml
+      - name: Package skill
+        run: python scripts/package_skill.py log-pulse dist
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-pulse-skill
+          path: dist/log-pulse.skill
+      - name: Upload release asset
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/log-pulse.skill
