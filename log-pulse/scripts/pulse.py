@@ -16,11 +16,13 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 DEFAULT_ERROR_REGEXES = [
     r"\berror\b",
@@ -35,6 +37,10 @@ DEFAULT_WARNING_REGEXES = [
     r"\bwarning\b",
     r"\bdeprecationwarning\b",
 ]
+
+PROC_POLL_INTERVAL_S = 0.1
+_PS_PGID_UNAVAILABLE = object()
+_PS_PGID_ARGS: Any = None
 
 
 def _now() -> float:
@@ -88,6 +94,177 @@ def _short(s: str, n: int) -> str:
     if n <= 3:
         return s[:n]
     return s[: n - 3] + "..."
+
+
+def _signal_name(sig_num: int) -> str:
+    try:
+        return signal.Signals(sig_num).name
+    except Exception:
+        return f"SIG{sig_num}"
+
+
+def _ps_pgid_candidates() -> List[List[str]]:
+    if sys.platform.startswith("darwin"):
+        return [
+            ["ps", "-o", "pid=", "-g"],
+            ["ps", "-o", "pid=", "--pgid"],
+        ]
+    if sys.platform.startswith("linux"):
+        return [
+            ["ps", "-o", "pid=", "--pgid"],
+            ["ps", "-o", "pid=", "-g"],
+        ]
+    return [
+        ["ps", "-o", "pid=", "-g"],
+        ["ps", "-o", "pid=", "--pgid"],
+    ]
+
+
+def _can_track_group() -> bool:
+    return os.name == "posix" and hasattr(os, "killpg")
+
+
+def _pgid_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _parse_pid_list(text: str) -> Set[int]:
+    pids: Set[int] = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            pids.add(int(line))
+        except ValueError:
+            continue
+    return pids
+
+
+def _run_ps_pgid(args: List[str], pgid: int) -> Tuple[Optional[Set[int]], bool]:
+    try:
+        result = subprocess.run(
+            [*args, str(pgid)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, PermissionError, OSError):
+        return None, False
+    if result.returncode != 0 and result.stderr.strip():
+        return None, False
+    return _parse_pid_list(result.stdout), True
+
+
+def _list_pgid_pids(pgid: int) -> Optional[Set[int]]:
+    global _PS_PGID_ARGS
+    if _PS_PGID_ARGS is _PS_PGID_UNAVAILABLE:
+        return None
+    if isinstance(_PS_PGID_ARGS, list):
+        pids, ok = _run_ps_pgid(_PS_PGID_ARGS, pgid)
+        if ok:
+            return pids
+        _PS_PGID_ARGS = _PS_PGID_UNAVAILABLE
+        return None
+    for args in _ps_pgid_candidates():
+        pids, ok = _run_ps_pgid(args, pgid)
+        if ok:
+            _PS_PGID_ARGS = args
+            return pids
+    _PS_PGID_ARGS = _PS_PGID_UNAVAILABLE
+    return None
+
+
+def _diff_proc_changes(previous: Set[int], current: Set[int]) -> List[str]:
+    events: List[str] = []
+    started = sorted(current - previous)
+    exited = sorted(previous - current)
+    for pid in started:
+        events.append(f"pulse: proc-start pid={pid}")
+    for pid in exited:
+        events.append(f"pulse: proc-exit pid={pid}")
+    return events
+
+
+def _emit_exit(exit_code: int, log_path: Path) -> int:
+    normalized = exit_code
+    if exit_code < 0:
+        sig = -exit_code
+        normalized = 128 + sig
+        print(f"pulse: FAILED signal={_signal_name(sig)} exit={normalized} log={log_path}")
+    else:
+        status = "ok" if exit_code == 0 else "FAILED"
+        print(f"pulse: {status} exit={exit_code} log={log_path}")
+    if normalized != 0:
+        print(
+            "pulse: extract: python3 "
+            + shlex.quote(str(Path(__file__).resolve()))
+            + " extract --log "
+            + shlex.quote(str(log_path))
+        )
+    return int(normalized)
+
+
+class _ProcTracker:
+    def __init__(self, proc: subprocess.Popen, pgid: Optional[int], track_group_alive: bool) -> None:
+        self.track_group_alive = track_group_alive
+        self.track_group_list = False
+        self.pgid = pgid
+        self.last_pids: Set[int] = set()
+        self._events: List[str] = []
+        self._seed(proc)
+
+    def _seed(self, proc: subprocess.Popen) -> None:
+        current_pids: Optional[Set[int]] = None
+        if self.track_group_alive and self.pgid is not None:
+            current_pids = _list_pgid_pids(self.pgid)
+            if current_pids is not None:
+                self.track_group_list = True
+                if not current_pids and proc.poll() is None:
+                    current_pids = None
+        if current_pids is None:
+            current_pids = {proc.pid}
+        self.last_pids = current_pids
+        self._events.extend(_diff_proc_changes(set(), current_pids))
+
+    def scan(self, proc: subprocess.Popen, rc: Optional[int]) -> Optional[Set[int]]:
+        current_pids: Optional[Set[int]] = None
+        if self.track_group_list and self.pgid is not None:
+            current_pids = _list_pgid_pids(self.pgid)
+            if current_pids is not None and not current_pids and rc is None:
+                current_pids = None
+        elif not self.track_group_list:
+            current_pids = {proc.pid} if rc is None else set()
+        if current_pids is not None:
+            self._events.extend(_diff_proc_changes(self.last_pids, current_pids))
+            self.last_pids = current_pids
+        return current_pids
+
+    def group_alive(self, current_pids: Optional[Set[int]], rc: Optional[int]) -> bool:
+        if self.track_group_alive and self.pgid is not None:
+            if self.track_group_list and current_pids is not None:
+                return len(current_pids) > 0
+            return _pgid_alive(self.pgid)
+        return rc is None
+
+    def ensure_exit_events(self, group_alive: bool, current_pids: Optional[Set[int]]) -> None:
+        if not group_alive and current_pids is None and self.last_pids:
+            self._events.extend(_diff_proc_changes(self.last_pids, set()))
+            self.last_pids = set()
+
+    def drain_events(self) -> List[str]:
+        if not self._events:
+            return []
+        events = self._events
+        self._events = []
+        return events
 
 
 def _default_state() -> Dict[str, Any]:
@@ -250,32 +427,55 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"pulse: log={log_path}")
     print(f"pulse: cmd={' '.join(shlex.quote(x) for x in cmd)}")
 
+    track_group_alive = _can_track_group()
     mode = "ab" if args.append else "wb"
     with log_path.open(mode) as log_f:
-        proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, cwd=args.cwd, env=_build_env(args))
+        popen_kwargs = {
+            "stdout": log_f,
+            "stderr": subprocess.STDOUT,
+            "cwd": args.cwd,
+            "env": _build_env(args),
+        }
+        if track_group_alive:
+            popen_kwargs["start_new_session"] = True
+        proc = subprocess.Popen(cmd, **popen_kwargs)
+    pgid = proc.pid if track_group_alive else None
 
-    last_emit = 0.0
+    tracker = _ProcTracker(proc, pgid, track_group_alive)
+    interval_s = max(0.0, float(args.interval))
+    last_emit = _now()
+    next_pulse = last_emit + interval_s
+    next_proc_scan = last_emit
+    primary_rc: Optional[int] = None
     while True:
         rc = proc.poll()
+        if rc is not None and primary_rc is None:
+            primary_rc = rc
         now = _now()
-        if rc is None and (now - last_emit) < float(args.interval):
-            time.sleep(0.1)
+
+        current_pids: Optional[Set[int]] = None
+        if now >= next_proc_scan:
+            current_pids = tracker.scan(proc, rc)
+            next_proc_scan = now + PROC_POLL_INTERVAL_S
+
+        group_alive = tracker.group_alive(current_pids, rc)
+        tracker.ensure_exit_events(group_alive, current_pids)
+
+        if now < next_pulse and group_alive:
+            sleep_for = min(next_pulse, next_proc_scan) - now
+            if sleep_for > 0:
+                time.sleep(min(sleep_for, 0.1))
             continue
 
+        for line in tracker.drain_events():
+            print(line)
         print(pulse_once(log_path, state_path, window_s=args.window, include_last_line=not args.no_last_line))
         last_emit = now
+        next_pulse = last_emit + interval_s
 
-        if rc is not None:
-            status = "ok" if rc == 0 else "FAILED"
-            print(f"pulse: {status} exit={rc} log={log_path}")
-            if rc != 0:
-                print(
-                    "pulse: extract: python3 "
-                    + shlex.quote(str(Path(__file__).resolve()))
-                    + " extract --log "
-                    + shlex.quote(str(log_path))
-                )
-            return int(rc)
+        if not group_alive:
+            exit_code = primary_rc if primary_rc is not None else (proc.poll() or 0)
+            return _emit_exit(exit_code, log_path)
 
 
 def _build_env(args: argparse.Namespace) -> Optional[Dict[str, str]]:
