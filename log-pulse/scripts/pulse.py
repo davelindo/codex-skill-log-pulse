@@ -1,130 +1,323 @@
 #!/usr/bin/env python3
-"""
-pulse.py - keep noisy command output out of the Codex conversation.
-
-Core idea:
-- write *all* stdout/stderr to a log file
-- periodically print a single "pulse" line summarizing recent log activity:
-    last 10s: +243 lines | errors:0 warnings:0 | total:12034
-
-This reduces token usage during long-running test/build/debug sessions.
-"""
+"""Run noisy commands while emitting only decision-relevant status lines."""
 from __future__ import annotations
 
 import argparse
-import json
+import codecs
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Deque, Dict, Iterable, List, Optional, Pattern, Sequence, Tuple
 
-DEFAULT_ERROR_REGEXES = [
+
+DEFAULT_ERROR_REGEXES = (
     r"\berror\b",
     r"\bfatal\b",
     r"\bpanic\b",
     r"\bfail(?:ed|ure)?\b",
     r"\bexception\b",
     r"\btraceback\b",
-]
-
-DEFAULT_WARNING_REGEXES = [
+)
+DEFAULT_WARNING_REGEXES = (
     r"\bwarning\b",
     r"\bdeprecationwarning\b",
-]
+)
 
-PROC_POLL_INTERVAL_S = 0.1
-_PS_PGID_UNAVAILABLE = object()
-_PS_PGID_ARGS: Any = None
+ZERO_COUNT_REGEXES = tuple(
+    re.compile(expr, re.IGNORECASE)
+    for expr in (
+        r"\b0\s+(?:errors?|fail(?:ed|ures?)|exceptions?|warnings?)\b",
+        r"\b(?:errors?|fail(?:ed|ures?)|exceptions?|warnings?)\s*[:=]\s*(?:0|none)\b",
+        r"\bno\s+(?:errors?|failures?|exceptions?|warnings?)\b",
+    )
+)
+ANSI_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|authorization)\b"
+    r"(\s*[:=]\s*|\s+)(?:\"[^\"]*\"|'[^']*'|\S+)"
+)
+BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
+URL_CREDENTIAL_RE = re.compile(r"(?i)(://)[^/@\s:]+:[^/@\s]+@")
+TIMESTAMP_PREFIX_RE = re.compile(
+    r"^\s*(?:\[?\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\]?\s*)"
+)
+LEVEL_PREFIX_RE = re.compile(
+    r"^\s*(?:\[(?:ERROR|WARN(?:ING)?|INFO|DEBUG|TRACE|FATAL|CRIT)\]"
+    r"|(?:ERROR|WARN(?:ING)?|INFO|DEBUG|TRACE|FATAL|CRIT)\s*[:|-])\s*",
+    re.IGNORECASE,
+)
+UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b", re.I)
+HEX_RE = re.compile(r"\b0x[0-9a-f]+\b", re.I)
+NUMBER_RE = re.compile(r"(?<![A-Za-z])[-+]?\d+(?:\.\d+)?(?![A-Za-z])")
 
-
-def _now() -> float:
-    return time.time()
-
-
-def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(path)
-
-
-def _load_json(path: Path) -> Optional[Dict[str, Any]]:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None
-    except Exception:
-        return None
-
-
-def _parse_regex_list(val: str) -> List[str]:
-    # Accept comma or semicolon separated.
-    parts = [p.strip() for p in re.split(r"[;,]\s*", val) if p.strip()]
-    return parts
-
-
-def _compile_regexes(regexes: Sequence[str]) -> List[re.Pattern]:
-    return [re.compile(r, re.IGNORECASE) for r in regexes]
-
-
-def _load_patterns() -> Tuple[List[re.Pattern], List[re.Pattern]]:
-    err = os.environ.get("PULSE_ERROR_REGEX")
-    warn = os.environ.get("PULSE_WARNING_REGEX")
-    err_list = _parse_regex_list(err) if err else DEFAULT_ERROR_REGEXES
-    warn_list = _parse_regex_list(warn) if warn else DEFAULT_WARNING_REGEXES
-    return _compile_regexes(err_list), _compile_regexes(warn_list)
+SCAN_INTERVAL_SECONDS = 0.1
+MAX_TRACKED_GROUPS = 1000
+MAX_IMMEDIATE_ERROR_ALERTS = 3
+DEFAULT_EXCERPT_LENGTH = 160
+DESCENDANT_TIMEOUT_EXIT = 124
 
 
-def _match_any(patterns: List[re.Pattern], line: str) -> bool:
-    return any(p.search(line) for p in patterns)
-
-
-def _short(s: str, n: int) -> str:
-    s = s.strip()
-    if n <= 0:
+def _short(value: str, limit: int) -> str:
+    value = value.strip()
+    if limit <= 0:
         return ""
-    if len(s) <= n:
-        return s
-    if n <= 3:
-        return s[:n]
-    return s[: n - 3] + "..."
+    if len(value) <= limit:
+        return value
+    if limit <= 3:
+        return value[:limit]
+    return value[: limit - 3] + "..."
 
 
-def _signal_name(sig_num: int) -> str:
+def _quote_excerpt(value: str, limit: int = DEFAULT_EXCERPT_LENGTH) -> str:
+    value = _short(value, limit).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{value}"'
+
+
+def _visible_text(raw: str) -> str:
+    text = ANSI_RE.sub("", raw)
+    text = CONTROL_RE.sub("", text)
+    text = URL_CREDENTIAL_RE.sub(r"\1<redacted>@", text)
+    text = BEARER_RE.sub("Bearer <redacted>", text)
+    text = SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}<redacted>", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _fingerprint(visible: str) -> str:
+    value = TIMESTAMP_PREFIX_RE.sub("", visible)
+    value = LEVEL_PREFIX_RE.sub("", value)
+    value = UUID_RE.sub("<uuid>", value)
+    value = HEX_RE.sub("<hex>", value)
+    value = NUMBER_RE.sub("<n>", value)
+    return value.casefold()
+
+
+def _compile_regexes(values: Iterable[str], label: str) -> List[Pattern[str]]:
+    compiled: List[Pattern[str]] = []
+    for value in values:
+        try:
+            compiled.append(re.compile(value, re.IGNORECASE))
+        except re.error as exc:
+            raise ValueError(f"invalid {label} regex {value!r}: {exc}") from exc
+    return compiled
+
+
+def _classify(line: str, errors: Sequence[Pattern[str]], warnings: Sequence[Pattern[str]]) -> Optional[str]:
+    candidate = line
+    for pattern in ZERO_COUNT_REGEXES:
+        candidate = pattern.sub("", candidate)
+    if any(pattern.search(candidate) for pattern in errors):
+        return "error"
+    if any(pattern.search(candidate) for pattern in warnings):
+        return "warning"
+    return None
+
+
+def _signal_name(number: int) -> str:
     try:
-        return signal.Signals(sig_num).name
-    except Exception:
-        return f"SIG{sig_num}"
+        return signal.Signals(number).name
+    except (ValueError, OSError):
+        return f"SIG{number}"
 
 
-def _ps_pgid_candidates() -> List[List[str]]:
-    if sys.platform.startswith("darwin"):
-        return [
-            ["ps", "-o", "pid=", "-g"],
-            ["ps", "-o", "pid=", "--pgid"],
-        ]
-    if sys.platform.startswith("linux"):
-        return [
-            ["ps", "-o", "pid=", "--pgid"],
-            ["ps", "-o", "pid=", "-g"],
-        ]
-    return [
-        ["ps", "-o", "pid=", "-g"],
-        ["ps", "-o", "pid=", "--pgid"],
-    ]
+def _normalize_exit_code(returncode: int) -> Tuple[int, Optional[int]]:
+    if returncode < 0:
+        sig = -returncode
+        return 128 + sig, sig
+    return int(returncode), None
 
 
-def _can_track_group() -> bool:
-    return os.name == "posix" and hasattr(os, "killpg")
+@dataclass
+class Group:
+    count: int
+    exemplar: str
+    first_line: int
+    last_line: int
 
 
-def _pgid_alive(pgid: int) -> bool:
+@dataclass
+class ScanResult:
+    new_error_groups: List[Group]
+    progress: Optional[str]
+
+
+class LogMonitor:
+    def __init__(
+        self,
+        *,
+        start_pos: int,
+        error_patterns: Sequence[Pattern[str]],
+        warning_patterns: Sequence[Pattern[str]],
+        progress_patterns: Sequence[Pattern[str]],
+        now: float,
+    ) -> None:
+        self.pos = int(start_pos)
+        self.total_lines = 0
+        self.error_lines = 0
+        self.warning_lines = 0
+        self.last_activity = now
+        self.last_nonempty = ""
+        self.error_groups: Dict[str, Group] = {}
+        self.warning_groups: Dict[str, Group] = {}
+        self._unreported_warnings: Deque[str] = deque()
+        self._error_patterns = list(error_patterns)
+        self._warning_patterns = list(warning_patterns)
+        self._progress_patterns = list(progress_patterns)
+        self._last_progress_key: Optional[str] = None
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._carry = ""
+
+    def _reset_stream(self) -> None:
+        self.pos = 0
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._carry = ""
+
+    @staticmethod
+    def _record_group(groups: Dict[str, Group], key: str, exemplar: str, line_number: int) -> Tuple[Group, bool]:
+        if key not in groups and len(groups) >= MAX_TRACKED_GROUPS:
+            key = "<other>"
+            exemplar = "additional distinct messages"
+        group = groups.get(key)
+        if group is None:
+            group = Group(count=1, exemplar=exemplar, first_line=line_number, last_line=line_number)
+            groups[key] = group
+            return group, True
+        group.count += 1
+        group.last_line = line_number
+        group.exemplar = exemplar
+        return group, False
+
+    def _ingest_line(self, raw: str) -> Tuple[Optional[Group], Optional[str]]:
+        self.total_lines += 1
+        visible = _visible_text(raw)
+        if not visible:
+            return None, None
+        self.last_nonempty = visible
+        kind = _classify(visible, self._error_patterns, self._warning_patterns)
+        key = _fingerprint(visible)
+        new_error: Optional[Group] = None
+        if kind == "error":
+            self.error_lines += 1
+            group, is_new = self._record_group(self.error_groups, key, visible, self.total_lines)
+            if is_new:
+                new_error = group
+        elif kind == "warning":
+            self.warning_lines += 1
+            group, is_new = self._record_group(self.warning_groups, key, visible, self.total_lines)
+            if is_new:
+                self._unreported_warnings.append(key)
+
+        progress: Optional[str] = None
+        if self._progress_patterns and any(pattern.search(visible) for pattern in self._progress_patterns):
+            progress_key = visible.casefold()
+            if progress_key != self._last_progress_key:
+                self._last_progress_key = progress_key
+                progress = visible
+        return new_error, progress
+
+    def _collect_line(self, raw: str, new_errors: List[Group], progress: Optional[str]) -> Optional[str]:
+        new_error, new_progress = self._ingest_line(raw)
+        if new_error is not None:
+            new_errors.append(new_error)
+        return new_progress if new_progress is not None else progress
+
+    def consume(self, log_path: Path, *, now: float, final: bool = False) -> ScanResult:
+        new_errors: List[Group] = []
+        progress: Optional[str] = None
+        try:
+            end_pos = log_path.stat().st_size
+        except FileNotFoundError:
+            return ScanResult(new_errors, progress)
+
+        if end_pos < self.pos:
+            self._reset_stream()
+        if end_pos > self.pos:
+            with log_path.open("rb") as stream:
+                stream.seek(self.pos)
+                while True:
+                    chunk = stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    decoded = self._decoder.decode(chunk, final=False)
+                    text = self._carry + decoded
+                    parts = re.split(r"\r\n|\r|\n", text)
+                    self._carry = parts.pop() if parts else ""
+                    for raw in parts:
+                        progress = self._collect_line(raw, new_errors, progress)
+            self.pos = end_pos
+            self.last_activity = now
+
+        if final:
+            remainder = self._carry + self._decoder.decode(b"", final=True)
+            self._carry = ""
+            if remainder:
+                progress = self._collect_line(remainder, new_errors, progress)
+        return ScanResult(new_errors, progress)
+
+    def pop_warning_exemplar(self) -> Optional[str]:
+        while self._unreported_warnings:
+            key = self._unreported_warnings.popleft()
+            group = self.warning_groups.get(key)
+            if group is not None:
+                return group.exemplar
+        return None
+
+    def latest_error(self) -> Optional[str]:
+        if not self.error_groups:
+            return None
+        return max(self.error_groups.values(), key=lambda group: group.last_line).exemplar
+
+    def latest_warning(self) -> Optional[str]:
+        if not self.warning_groups:
+            return None
+        return max(self.warning_groups.values(), key=lambda group: group.last_line).exemplar
+
+
+class _RunSignal(Exception):
+    def __init__(self, number: int) -> None:
+        super().__init__(number)
+        self.number = number
+
+
+def _build_child_env(values: Optional[Sequence[str]]) -> Dict[str, str]:
+    env = os.environ.copy()
+    for item in values or ():
+        if "=" not in item:
+            raise ValueError(f"invalid --env value {item!r}; expected KEY=VALUE")
+        key, value = item.split("=", 1)
+        if not key:
+            raise ValueError("invalid --env value; KEY cannot be empty")
+        env[key] = value
+    return env
+
+
+def _preflight_command(command: Sequence[str], *, cwd: Optional[str], env: Dict[str, str]) -> None:
+    executable = command[0]
+    if cwd is not None and not Path(cwd).expanduser().is_dir():
+        raise ValueError(f"working directory does not exist: {cwd}")
+    if os.sep in executable or (os.altsep and os.altsep in executable):
+        candidate = Path(executable).expanduser()
+        if not candidate.is_absolute() and cwd:
+            candidate = Path(cwd).expanduser() / candidate
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            raise FileNotFoundError(executable)
+    elif shutil.which(executable, path=env.get("PATH")) is None:
+        raise FileNotFoundError(executable)
+
+
+def _group_alive(pgid: Optional[int]) -> bool:
+    if pgid is None:
+        return False
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
@@ -134,444 +327,332 @@ def _pgid_alive(pgid: int) -> bool:
     return True
 
 
-def _parse_pid_list(text: str) -> Set[int]:
-    pids: Set[int] = set()
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            pids.add(int(line))
-        except ValueError:
-            continue
-    return pids
-
-
-def _run_ps_pgid(args: List[str], pgid: int) -> Tuple[Optional[Set[int]], bool]:
+def _forward_signal(proc: subprocess.Popen, pgid: Optional[int], number: int) -> None:
     try:
-        result = subprocess.run(
-            [*args, str(pgid)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
-    except (FileNotFoundError, PermissionError, OSError):
-        return None, False
-    if result.returncode != 0 and result.stderr.strip():
-        return None, False
-    return _parse_pid_list(result.stdout), True
+        if pgid is not None:
+            os.killpg(pgid, number)
+        elif proc.poll() is None:
+            proc.send_signal(number)
+    except ProcessLookupError:
+        pass
 
 
-def _list_pgid_pids(pgid: int) -> Optional[Set[int]]:
-    global _PS_PGID_ARGS
-    if _PS_PGID_ARGS is _PS_PGID_UNAVAILABLE:
-        return None
-    if isinstance(_PS_PGID_ARGS, list):
-        pids, ok = _run_ps_pgid(_PS_PGID_ARGS, pgid)
-        if ok:
-            return pids
-        _PS_PGID_ARGS = _PS_PGID_UNAVAILABLE
-        return None
-    for args in _ps_pgid_candidates():
-        pids, ok = _run_ps_pgid(args, pgid)
-        if ok:
-            _PS_PGID_ARGS = args
-            return pids
-    _PS_PGID_ARGS = _PS_PGID_UNAVAILABLE
-    return None
+def _format_elapsed(seconds: float) -> str:
+    if seconds < 10:
+        return f"{seconds:.1f}s"
+    return f"{int(seconds)}s"
 
 
-def _diff_proc_changes(previous: Set[int], current: Set[int]) -> List[str]:
-    events: List[str] = []
-    started = sorted(current - previous)
-    exited = sorted(previous - current)
-    for pid in started:
-        events.append(f"pulse: proc-start pid={pid}")
-    for pid in exited:
-        events.append(f"pulse: proc-exit pid={pid}")
-    return events
-
-
-def _emit_exit(exit_code: int, log_path: Path) -> int:
-    normalized = exit_code
-    if exit_code < 0:
-        sig = -exit_code
-        normalized = 128 + sig
-        print(f"pulse: FAILED signal={_signal_name(sig)} exit={normalized} log={log_path}")
-    else:
-        status = "ok" if exit_code == 0 else "FAILED"
-        print(f"pulse: {status} exit={exit_code} log={log_path}")
-    if normalized != 0:
-        print(
-            "pulse: extract: python3 "
-            + shlex.quote(str(Path(__file__).resolve()))
-            + " extract --log "
-            + shlex.quote(str(log_path))
-        )
-    return int(normalized)
-
-
-class _ProcTracker:
-    def __init__(self, proc: subprocess.Popen, pgid: Optional[int], track_group_alive: bool) -> None:
-        self.track_group_alive = track_group_alive
-        self.track_group_list = False
-        self.pgid = pgid
-        self.last_pids: Set[int] = set()
-        self._events: List[str] = []
-        self._seed(proc)
-
-    def _seed(self, proc: subprocess.Popen) -> None:
-        current_pids: Optional[Set[int]] = None
-        if self.track_group_alive and self.pgid is not None:
-            current_pids = _list_pgid_pids(self.pgid)
-            if current_pids is not None:
-                self.track_group_list = True
-                if not current_pids and proc.poll() is None:
-                    current_pids = None
-        if current_pids is None:
-            current_pids = {proc.pid}
-        self.last_pids = current_pids
-        self._events.extend(_diff_proc_changes(set(), current_pids))
-
-    def scan(self, proc: subprocess.Popen, rc: Optional[int]) -> Optional[Set[int]]:
-        current_pids: Optional[Set[int]] = None
-        if self.track_group_list and self.pgid is not None:
-            current_pids = _list_pgid_pids(self.pgid)
-            if current_pids is not None and not current_pids and rc is None:
-                current_pids = None
-        elif not self.track_group_list:
-            current_pids = {proc.pid} if rc is None else set()
-        if current_pids is not None:
-            self._events.extend(_diff_proc_changes(self.last_pids, current_pids))
-            self.last_pids = current_pids
-        return current_pids
-
-    def group_alive(self, current_pids: Optional[Set[int]], rc: Optional[int]) -> bool:
-        if self.track_group_alive and self.pgid is not None:
-            if self.track_group_list and current_pids is not None:
-                return len(current_pids) > 0
-            return _pgid_alive(self.pgid)
-        return rc is None
-
-    def ensure_exit_events(self, group_alive: bool, current_pids: Optional[Set[int]]) -> None:
-        if not group_alive and current_pids is None and self.last_pids:
-            self._events.extend(_diff_proc_changes(self.last_pids, set()))
-            self.last_pids = set()
-
-    def drain_events(self) -> List[str]:
-        if not self._events:
-            return []
-        events = self._events
-        self._events = []
-        return events
-
-
-def _default_state() -> Dict[str, Any]:
-    return {"created_at": _now(), "pos": 0, "total_lines": 0, "samples": [], "last_line": ""}
-
-
-def _load_state(state_path: Path) -> Dict[str, Any]:
-    st = _load_json(state_path)
-    if not isinstance(st, dict):
-        st = _default_state()
-    for k, v in _default_state().items():
-        st.setdefault(k, v)
-    if not isinstance(st.get("samples"), list):
-        st["samples"] = []
-    return st
-
-
-def _read_delta(
-    log_path: Path,
-    start_pos: int,
-    err_pats: List[re.Pattern],
-    warn_pats: List[re.Pattern],
-) -> Tuple[int, int, int, str, int]:
-    """
-    Returns (new_lines, err_lines, warn_lines, last_line, end_pos).
-    Counts lines by '\n'. Treats file truncation as reset.
-    """
-    try:
-        end_pos = log_path.stat().st_size
-    except FileNotFoundError:
-        return 0, 0, 0, "", start_pos
-
-    if end_pos < start_pos:
-        start_pos = 0
-
-    if end_pos == start_pos:
-        return 0, 0, 0, "", end_pos
-
-    new_lines = err_lines = warn_lines = 0
-    last_line = ""
-    carry = ""
-
-    with log_path.open("rb") as f:
-        f.seek(start_pos)
-        while True:
-            chunk = f.read(1024 * 1024)
-            if not chunk:
-                break
-            text = chunk.decode("utf-8", errors="replace")
-            text = text.replace("\r\n", "\n").replace("\r", "\n")
-            if carry:
-                text = carry + text
-                carry = ""
-            parts = text.split("\n")
-            carry = parts.pop() if parts else ""
-            for line in parts:
-                new_lines += 1
-                if line:
-                    if _match_any(err_pats, line):
-                        err_lines += 1
-                    if _match_any(warn_pats, line):
-                        warn_lines += 1
-                    last_line = line
-
-    if carry:
-        last_line = carry
-
-    return new_lines, err_lines, warn_lines, _short(last_line, 120), end_pos
-
-
-def _prune_samples(samples: List[Dict[str, Any]], cutoff: float) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for s in samples:
-        try:
-            if float(s.get("t", 0)) >= cutoff:
-                out.append(s)
-        except Exception:
-            pass
-    return out
-
-
-def pulse_once(log_path: Path, state_path: Path, window_s: int, include_last_line: bool = True) -> str:
-    err_pats, warn_pats = _load_patterns()
-    now = _now()
-    state = _load_state(state_path)
-
-    # Read new data since last pos
-    new_lines, err_lines, warn_lines, last_line, end_pos = _read_delta(
-        log_path, int(state.get("pos", 0)), err_pats, warn_pats
-    )
-
-    state["pos"] = int(end_pos)
-    state["total_lines"] = int(state.get("total_lines", 0)) + int(new_lines)
-    if last_line:
-        state["last_line"] = last_line
-
-    # Record sample and prune
-    samples = list(state.get("samples", []))
-    samples.append({"t": now, "lines": new_lines, "err": err_lines, "warn": warn_lines})
-    cutoff = now - float(window_s) - 1.0
-    samples = _prune_samples(samples, cutoff)
-    state["samples"] = samples
-
-    # Window totals
-    window_cutoff = now - float(window_s)
-    w_lines = w_err = w_warn = 0
-    for s in samples:
-        if float(s.get("t", 0)) < window_cutoff:
-            continue
-        w_lines += int(s.get("lines", 0))
-        w_err += int(s.get("err", 0))
-        w_warn += int(s.get("warn", 0))
-
-    _atomic_write_json(state_path, state)
-
+def _emit_final(monitor: LogMonitor, *, raw_returncode: int, elapsed: float, log_path: Path) -> int:
+    exit_code, sig = _normalize_exit_code(raw_returncode)
+    status = "ok" if exit_code == 0 else "FAILED"
     parts = [
-        f"last {window_s}s: +{w_lines} lines",
-        f"errors:{w_err}",
-        f"warnings:{w_warn}",
-        f"total:{int(state['total_lines'])}",
+        f"pulse: {status}",
+        f"exit={exit_code}",
+        f"elapsed={_format_elapsed(elapsed)}",
+        f"lines={monitor.total_lines}",
+        f"errors={monitor.error_lines}",
+        f"warnings={monitor.warning_lines}",
+        f"log={log_path}",
     ]
-    if include_last_line and state.get("last_line"):
-        parts.append(f'last:"{state["last_line"]}"')
-    if not log_path.exists():
-        parts.append(f"log-missing:{log_path}")
-    return " | ".join(parts)
+    if sig is not None:
+        parts.insert(2, f"signal={_signal_name(sig)}")
+    if monitor.error_lines:
+        parts.append(f"error={_quote_excerpt(monitor.latest_error() or '')}")
+    elif exit_code != 0 and monitor.last_nonempty:
+        parts.append(f"tail={_quote_excerpt(monitor.last_nonempty)}")
+    elif monitor.warning_lines:
+        parts.append(f"warning={_quote_excerpt(monitor.latest_warning() or '')}")
+    print(" ".join(parts), flush=True)
+    return exit_code
 
 
-def cmd_pulse(args: argparse.Namespace) -> int:
-    log_path = Path(args.log).expanduser()
-    state_path = Path(args.state or (str(log_path) + ".pulse.json")).expanduser()
-    print(pulse_once(log_path, state_path, window_s=args.window, include_last_line=not args.no_last_line))
-    return 0
+def _resolve_log_path(value: Optional[str]) -> Path:
+    if value:
+        path = Path(value).expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+    fd, raw_path = tempfile.mkstemp(prefix="pulse-", suffix=".log")
+    os.close(fd)
+    return Path(raw_path).resolve()
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    cmd = list(args.command)
-    if cmd and cmd[0] == "--":
-        cmd = cmd[1:]
-    if not cmd:
-        raise SystemExit("Usage: pulse.py run [opts] -- <command...>")
+    command = list(args.command)
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        raise ValueError("run requires a command after --")
+    if args.heartbeat <= 0:
+        raise ValueError("--heartbeat must be greater than zero")
+    if args.descendant_timeout < 0:
+        raise ValueError("--descendant-timeout cannot be negative")
+    if args.progress_interval < 0:
+        raise ValueError("--progress-interval cannot be negative")
 
-    if args.log:
-        log_path = Path(args.log).expanduser()
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        if not args.append:
-            log_path.write_bytes(b"")
-    else:
-        fd, p = tempfile.mkstemp(prefix="pulse-", suffix=".log")
-        os.close(fd)
-        log_path = Path(p)
+    error_patterns = _compile_regexes(args.error_regex or DEFAULT_ERROR_REGEXES, "error")
+    warning_patterns = _compile_regexes(args.warning_regex or DEFAULT_WARNING_REGEXES, "warning")
+    progress_patterns = _compile_regexes(args.progress_regex or (), "progress")
+    child_env = _build_child_env(args.env)
+    cwd = str(Path(args.cwd).expanduser().resolve()) if args.cwd else None
+    try:
+        _preflight_command(command, cwd=cwd, env=child_env)
+    except FileNotFoundError:
+        print(f"pulse: FAILED launch exit=127 executable={shlex.quote(command[0])}", flush=True)
+        return 127
 
-    state_path = Path(args.state or (str(log_path) + ".pulse.json")).expanduser()
-    if not args.reuse_state and state_path.exists():
-        try:
-            state_path.unlink()
-        except Exception:
-            pass
-
-    print(f"pulse: log={log_path}")
-    print(f"pulse: cmd={' '.join(shlex.quote(x) for x in cmd)}")
-
-    track_group_alive = _can_track_group()
+    try:
+        log_path = _resolve_log_path(args.log)
+        start_pos = log_path.stat().st_size if args.append and log_path.exists() else 0
+    except OSError as exc:
+        print(f"pulse: FAILED log exit=73 reason={_quote_excerpt(str(exc))}", flush=True)
+        return 73
     mode = "ab" if args.append else "wb"
-    with log_path.open(mode) as log_f:
-        popen_kwargs = {
-            "stdout": log_f,
-            "stderr": subprocess.STDOUT,
-            "cwd": args.cwd,
-            "env": _build_env(args),
-        }
-        if track_group_alive:
-            popen_kwargs["start_new_session"] = True
-        proc = subprocess.Popen(cmd, **popen_kwargs)
-    pgid = proc.pid if track_group_alive else None
+    use_process_group = os.name == "posix" and hasattr(os, "killpg")
+    popen_kwargs = {
+        "stdout": None,
+        "stderr": subprocess.STDOUT,
+        "cwd": cwd,
+        "env": child_env,
+    }
+    if use_process_group:
+        popen_kwargs["start_new_session"] = True
 
-    tracker = _ProcTracker(proc, pgid, track_group_alive)
-    interval_s = max(0.0, float(args.interval))
-    last_emit = _now()
-    next_pulse = last_emit + interval_s
-    next_proc_scan = last_emit
-    primary_rc: Optional[int] = None
-    while True:
-        rc = proc.poll()
-        if rc is not None and primary_rc is None:
-            primary_rc = rc
-        now = _now()
+    try:
+        log_stream = log_path.open(mode)
+    except OSError as exc:
+        print(f"pulse: FAILED log exit=73 reason={_quote_excerpt(str(exc))}", flush=True)
+        return 73
+    try:
+        with log_stream:
+            popen_kwargs["stdout"] = log_stream
+            proc = subprocess.Popen(command, **popen_kwargs)
+    except OSError as exc:
+        print(f"pulse: FAILED launch exit=126 reason={_quote_excerpt(str(exc))}", flush=True)
+        return 126
 
-        current_pids: Optional[Set[int]] = None
-        if now >= next_proc_scan:
-            current_pids = tracker.scan(proc, rc)
-            next_proc_scan = now + PROC_POLL_INTERVAL_S
+    pgid = proc.pid if use_process_group else None
+    started = time.monotonic()
+    monitor = LogMonitor(
+        start_pos=start_pos,
+        error_patterns=error_patterns,
+        warning_patterns=warning_patterns,
+        progress_patterns=progress_patterns,
+        now=started,
+    )
+    startup = f"pulse: running log={log_path}"
+    if args.show_command:
+        startup += f" command={shlex.join(command)}"
+    print(startup, flush=True)
 
-        group_alive = tracker.group_alive(current_pids, rc)
-        tracker.ensure_exit_events(group_alive, current_pids)
+    old_handlers: Dict[int, object] = {}
 
-        if now < next_pulse and group_alive:
-            sleep_for = min(next_pulse, next_proc_scan) - now
-            if sleep_for > 0:
-                time.sleep(min(sleep_for, 0.1))
-            continue
+    def _handle(number: int, _frame: object) -> None:
+        raise _RunSignal(number)
 
-        for line in tracker.drain_events():
-            print(line)
-        print(pulse_once(log_path, state_path, window_s=args.window, include_last_line=not args.no_last_line))
-        last_emit = now
-        next_pulse = last_emit + interval_s
+    for number in (signal.SIGINT, signal.SIGTERM):
+        old_handlers[number] = signal.getsignal(number)
+        signal.signal(number, _handle)
 
-        if not group_alive:
-            exit_code = primary_rc if primary_rc is not None else (proc.poll() or 0)
-            return _emit_exit(exit_code, log_path)
+    last_visible = started
+    last_report_lines = 0
+    last_progress_emit = float("-inf")
+    immediate_alerts = 0
+    primary_returncode: Optional[int] = None
+    descendant_deadline: Optional[float] = None
+
+    try:
+        while True:
+            now = time.monotonic()
+            scan = monitor.consume(log_path, now=now)
+
+            if scan.new_error_groups and immediate_alerts < MAX_IMMEDIATE_ERROR_ALERTS:
+                group = scan.new_error_groups[-1]
+                immediate_alerts += 1
+                print(
+                    f"pulse: alert errors={monitor.error_lines} new={len(scan.new_error_groups)} "
+                    f"exemplar={_quote_excerpt(group.exemplar)}",
+                    flush=True,
+                )
+                last_visible = now
+                last_report_lines = monitor.total_lines
+
+            if scan.progress is not None and (now - last_progress_emit) >= args.progress_interval:
+                print(f"pulse: progress {_quote_excerpt(scan.progress)}", flush=True)
+                last_visible = now
+                last_report_lines = monitor.total_lines
+                last_progress_emit = now
+
+            if primary_returncode is None:
+                current = proc.poll()
+                if current is not None:
+                    primary_returncode = proc.wait()
+                    if use_process_group and _group_alive(pgid):
+                        descendant_deadline = now + args.descendant_timeout
+
+            descendants_alive = primary_returncode is not None and use_process_group and _group_alive(pgid)
+            if primary_returncode is not None and not descendants_alive:
+                monitor.consume(log_path, now=now, final=True)
+                return _emit_final(
+                    monitor,
+                    raw_returncode=primary_returncode,
+                    elapsed=now - started,
+                    log_path=log_path,
+                )
+
+            if descendants_alive and descendant_deadline is not None and now >= descendant_deadline:
+                monitor.consume(log_path, now=now, final=True)
+                main_exit, _ = _normalize_exit_code(primary_returncode or 0)
+                print(
+                    f"pulse: ATTENTION descendant-timeout={_format_elapsed(args.descendant_timeout)} "
+                    f"main_exit={main_exit} pgid={pgid} log={log_path}",
+                    flush=True,
+                )
+                return DESCENDANT_TIMEOUT_EXIT
+
+            if (now - last_visible) >= args.heartbeat:
+                warning = monitor.pop_warning_exemplar()
+                idle = max(0.0, now - monitor.last_activity)
+                parts = [
+                    "pulse: alive",
+                    f"elapsed={_format_elapsed(now - started)}",
+                    f"lines={monitor.total_lines}",
+                    f"(+{monitor.total_lines - last_report_lines})",
+                    f"errors={monitor.error_lines}",
+                    f"warnings={monitor.warning_lines}",
+                    f"idle={_format_elapsed(idle)}",
+                ]
+                if warning:
+                    parts.append(f"warning={_quote_excerpt(warning)}")
+                print(" ".join(parts), flush=True)
+                last_visible = now
+                last_report_lines = monitor.total_lines
+
+            time.sleep(SCAN_INTERVAL_SECONDS)
+    except _RunSignal as interrupted:
+        _forward_signal(proc, pgid, interrupted.number)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _forward_signal(proc, pgid, signal.SIGKILL)
+        now = time.monotonic()
+        monitor.consume(log_path, now=now, final=True)
+        normalized = 128 + interrupted.number
+        print(
+            f"pulse: FAILED signal={_signal_name(interrupted.number)} exit={normalized} "
+            f"elapsed={_format_elapsed(now - started)} lines={monitor.total_lines} "
+            f"errors={monitor.error_lines} warnings={monitor.warning_lines} log={log_path}",
+            flush=True,
+        )
+        return normalized
+    finally:
+        for number, handler in old_handlers.items():
+            signal.signal(number, handler)
 
 
-def _build_env(args: argparse.Namespace) -> Optional[Dict[str, str]]:
-    if not args.env:
-        return None
-    env = os.environ.copy()
-    for kv in args.env:
-        if "=" in kv:
-            k, v = kv.split("=", 1)
-            env[k] = v
-    return env
+def _iter_log_lines(log_path: Path) -> Iterable[Tuple[int, str]]:
+    with log_path.open("r", encoding="utf-8", errors="replace", newline=None) as stream:
+        for number, line in enumerate(stream, start=1):
+            yield number, line.rstrip("\r\n")
 
 
 def cmd_extract(args: argparse.Namespace) -> int:
-    log_path = Path(args.log).expanduser()
-    if not log_path.exists():
-        raise SystemExit(f"log missing: {log_path}")
+    log_path = Path(args.log).expanduser().resolve()
+    if not log_path.is_file():
+        raise ValueError(f"log does not exist: {log_path}")
+    if args.max_groups < 0 or args.max_line_len < 0 or args.tail_lines < 0:
+        raise ValueError("extract limits cannot be negative")
+    errors = _compile_regexes(args.error_regex or DEFAULT_ERROR_REGEXES, "error")
+    warnings = _compile_regexes(args.warning_regex or DEFAULT_WARNING_REGEXES, "warning")
 
-    err_pats, warn_pats = _load_patterns()
+    total = error_count = warning_count = 0
+    error_groups: Dict[str, Group] = {}
+    warning_groups: Dict[str, Group] = {}
+    tail: Deque[str] = deque(maxlen=args.tail_lines)
+    for number, raw in _iter_log_lines(log_path):
+        total = number
+        visible = _visible_text(raw)
+        if args.tail_lines:
+            tail.append(visible)
+        if not visible:
+            continue
+        kind = _classify(visible, errors, warnings)
+        key = _fingerprint(visible)
+        if kind == "error":
+            error_count += 1
+            LogMonitor._record_group(error_groups, key, visible, number)
+        elif kind == "warning":
+            warning_count += 1
+            LogMonitor._record_group(warning_groups, key, visible, number)
 
-    max_matches = int(args.max_matches)
-    tail_n = int(args.tail_lines)
-
-    total = 0
-    err: List[Tuple[int, str]] = []
-    warn: List[Tuple[int, str]] = []
-    tail: List[str] = []
-
-    with log_path.open("r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            total += 1
-            line = line.rstrip("\n\r")
-            tail.append(line)
-            if len(tail) > tail_n:
-                tail.pop(0)
-
-            if _match_any(err_pats, line) and len(err) < max_matches:
-                err.append((total, _short(line, int(args.max_line_len))))
-            if _match_any(warn_pats, line) and len(warn) < max_matches:
-                warn.append((total, _short(line, int(args.max_line_len))))
-
-    print(f"pulse: log={log_path} lines={total} errors~={len(err)} warnings~={len(warn)}")
-    if err:
-        print("pulse: first error matches:")
-        for ln, txt in err:
-            print(f"  [E] L{ln}: {txt}")
-    if warn:
-        print("pulse: first warning matches:")
-        for ln, txt in warn:
-            print(f"  [W] L{ln}: {txt}")
-
+    print(
+        f"pulse: extract log={log_path} lines={total} errors={error_count} warnings={warning_count}",
+        flush=True,
+    )
+    for prefix, groups in (("E", error_groups), ("W", warning_groups)):
+        ranked = sorted(groups.values(), key=lambda group: (-group.count, group.first_line))[: args.max_groups]
+        for group in ranked:
+            excerpt = _short(group.exemplar, args.max_line_len)
+            print(f"  {prefix} {group.count}x L{group.last_line}: {excerpt}")
     if args.show_tail:
-        print(f"pulse: tail (last {tail_n} lines):")
-        for t in tail:
-            print(t)
+        print(f"pulse: tail lines={len(tail)}")
+        for line in tail:
+            print(_short(line, args.max_line_len))
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="pulse.py")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    parser = argparse.ArgumentParser(prog="pulse.py")
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
 
-    sp = sub.add_parser("pulse", help="Print one pulse line (stateful).")
-    sp.add_argument("--log", required=True)
-    sp.add_argument("--state", help="Default: <log>.pulse.json")
-    sp.add_argument("--window", type=int, default=10)
-    sp.add_argument("--no-last-line", action="store_true")
-    sp.set_defaults(func=cmd_pulse)
+    run = subparsers.add_parser("run", help="Run a command with token-efficient monitoring.")
+    run.add_argument("--log", help="Full-output log path; defaults to a private temporary file.")
+    run.add_argument("--append", action="store_true", help="Append and monitor only newly written output.")
+    run.add_argument("--heartbeat", type=float, default=60.0, help="Seconds without a visible event before liveness output.")
+    run.add_argument(
+        "--descendant-timeout",
+        type=float,
+        default=30.0,
+        help="Seconds to wait for descendants after the main process exits.",
+    )
+    run.add_argument("--progress-regex", action="append", help="Emit matching progress lines (repeatable).")
+    run.add_argument(
+        "--progress-interval",
+        type=float,
+        default=30.0,
+        help="Minimum seconds between progress excerpts.",
+    )
+    run.add_argument("--error-regex", action="append", help="Replace default error matching (repeatable).")
+    run.add_argument("--warning-regex", action="append", help="Replace default warning matching (repeatable).")
+    run.add_argument("--show-command", action="store_true", help="Include the full command in startup output.")
+    run.add_argument("--cwd")
+    run.add_argument("--env", action="append", help="KEY=VALUE passed to the child (repeatable).")
+    run.add_argument("command", nargs=argparse.REMAINDER)
+    run.set_defaults(func=cmd_run)
 
-    sr = sub.add_parser("run", help="Run a command and emit pulse lines.")
-    sr.add_argument("--log", help="Default: temp file")
-    sr.add_argument("--append", action="store_true", help="Append to an existing log file")
-    sr.add_argument("--state", help="Default: <log>.pulse.json")
-    sr.add_argument("--reuse-state", action="store_true")
-    sr.add_argument("--interval", type=float, default=5.0)
-    sr.add_argument("--window", type=int, default=10)
-    sr.add_argument("--cwd")
-    sr.add_argument("--env", action="append", help="KEY=VALUE (repeatable)")
-    sr.add_argument("--no-last-line", action="store_true")
-    sr.add_argument("command", nargs=argparse.REMAINDER)
-    sr.set_defaults(func=cmd_run)
-
-    se = sub.add_parser("extract", help="Compact error/warn report from a log file.")
-    se.add_argument("--log", required=True)
-    se.add_argument("--max-matches", type=int, default=10)
-    se.add_argument("--max-line-len", type=int, default=240)
-    se.add_argument("--tail-lines", type=int, default=60)
-    se.add_argument("--show-tail", action="store_true")
-    se.set_defaults(func=cmd_extract)
-
-    return p
+    extract = subparsers.add_parser("extract", help="Print a bounded diagnostic report from a log.")
+    extract.add_argument("--log", required=True)
+    extract.add_argument("--max-groups", type=int, default=5)
+    extract.add_argument("--max-line-len", type=int, default=200)
+    extract.add_argument("--show-tail", action="store_true")
+    extract.add_argument("--tail-lines", type=int, default=20)
+    extract.add_argument("--error-regex", action="append")
+    extract.add_argument("--warning-regex", action="append")
+    extract.set_defaults(func=cmd_extract)
+    return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
-    return int(args.func(args))
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except ValueError as exc:
+        print(f"pulse: FAILED argument exit=2 reason={_quote_excerpt(str(exc))}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"pulse: FAILED io exit=74 reason={_quote_excerpt(str(exc))}", file=sys.stderr)
+        return 74
 
 
 if __name__ == "__main__":

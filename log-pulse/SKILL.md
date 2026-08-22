@@ -1,81 +1,70 @@
 ---
 name: log-pulse
-description: Reduce token usage for long-running tests/builds by logging full output to a file and emitting periodic 1-line "pulse" summaries. Use for noisy commands like full test sweeps, builds, docker compose integration runs, or when asked to tee output to a log and show periodic summaries.
+description: Run noisy, non-interactive tests, builds, and integration commands without flooding model context. Keep complete stdout/stderr in a log while surfacing only bounded failures, explicit progress, sparse liveness, and the final outcome. Do not use for short commands, interactive programs, or when the user needs live verbatim output.
 ---
 
-# log-pulse
+# Log Pulse
 
-Use this skill to keep noisy command output out of the conversation by logging stdout/stderr to a file and emitting periodic one-line pulses.
+Use `scripts/pulse.py` from this skill's loaded directory. Resolve that directory from the active `SKILL.md`; do not assume a fixed installation root.
 
-## Default workflow
-
-1. Create a log file (prefer `mktemp`) and tell the user where it is.
-2. Start required services (for example, `docker compose up -d postgres`) if needed.
-3. Run the noisy command with pulse monitoring using `scripts/pulse.py run`:
-   - write full output to the log
-   - print only one-line pulses to the terminal/LLM
-4. On completion:
-   - report exit code and log path
-   - if it failed or pulses show errors/warnings, run `scripts/pulse.py extract` to show a compact report
-5. Clean up only if asked (do not tear down shared services by default).
-
-## Commands
-
-### Repo-scoped skill path
+## Run a noisy command
 
 ```bash
-python3 .codex/skills/log-pulse/scripts/pulse.py run --window 10 --interval 5 -- <COMMAND...>
+python3 <skill-directory>/scripts/pulse.py run -- <command...>
 ```
 
-### User-scoped skill path
+The wrapper writes combined stdout/stderr to a private temporary log by default. Its first line gives the absolute log path. Use `--log PATH` only when a stable path is useful.
+
+For a command with a known milestone format, add a narrow progress matcher:
 
 ```bash
-python3 ~/.codex/skills/log-pulse/scripts/pulse.py run --window 10 --interval 5 -- <COMMAND...>
-```
-
-## Example: Docker Compose + Postgres + full test sweep
-
-```bash
-LOG="$(mktemp -t test-sweep.XXXXXX.log)"
-
-docker compose up -d postgres
-
-python3 .codex/skills/log-pulse/scripts/pulse.py run \
-  --log "$LOG" \
-  --window 10 \
-  --interval 5 \
+python3 <skill-directory>/scripts/pulse.py run \
+  --progress-regex '^phase [0-9]+/[0-9]+' \
   -- \
-  docker compose run --rm app pytest -q
-
-# If it failed (or you saw errors/warnings in pulses):
-python3 .codex/skills/log-pulse/scripts/pulse.py extract --log "$LOG" --show-tail --tail-lines 80
-
-# Optional cleanup:
-docker compose down
+  <command...>
 ```
 
-## Pulse line format
+Do not invent a broad progress regex. Without one, rely on error alerts, the 60-second heartbeat, and the final result.
 
-```
-last 10s: +243 lines | errors:0 | warnings:0 | total:12034 | last:"...optional excerpt..."
-```
+## Interpret visible output
 
-Interpretation:
-- Interpret `last 10s: +X lines` as the scrollback avoided in the last window.
-- Treat `errors/warnings` as regex matches on new lines in that time window (heuristic).
-- Treat `total` as total lines written so far.
+- `pulse: alert`: a new error pattern needs attention. At most three error exemplars are emitted during one run; counts continue after that limit.
+- `pulse: progress`: an opt-in progress pattern changed. Progress excerpts are rate-limited.
+- `pulse: alive`: no other visible event occurred for 60 seconds. It reports activity and aggregate counts without repeating arbitrary log lines.
+- `pulse: ok` or `pulse: FAILED`: the main command and tracked descendants finished. Report this outcome and the log path to the user.
+- `pulse: ATTENTION descendant-timeout`: the main command exited, but descendants remained after 30 seconds. The wrapper returned 124 and left that process group running.
 
-## Tuning error/warning matching
+Warnings are heuristic matches. They are batched into a heartbeat or the final line instead of emitted immediately. Error and warning excerpts are bounded and redact common credential assignments; the full log remains unchanged and can still contain sensitive data.
+
+Descendant waiting and process-group handoff require POSIX process groups. On other platforms, the wrapper follows the main process only.
+
+## Diagnose a failure
+
+Use the bounded extractor only when the final line does not explain the failure:
 
 ```bash
-export PULSE_ERROR_REGEX="ERROR;FAILED;Traceback;panic"
-export PULSE_WARNING_REGEX="WARNING;DeprecationWarning"
+python3 <skill-directory>/scripts/pulse.py extract --log <log-path>
 ```
 
-(Comma-separated also works.)
+Add `--show-tail --tail-lines 20` only when grouped error and warning exemplars are insufficient. Do not paste the full log into context.
 
-## Script entry points
+Override matching narrowly when a tool uses domain-specific status words:
 
-- Use `scripts/pulse.py run` to execute a command and emit periodic pulse lines.
-- Use `scripts/pulse.py pulse` to emit a single pulse line for an existing log.
-- Use `scripts/pulse.py extract` to show a compact error/warning summary and optional tail.
+```bash
+python3 <skill-directory>/scripts/pulse.py run \
+  --error-regex '^BROKEN:' \
+  --warning-regex '^NOTICE:' \
+  -- \
+  <command...>
+```
+
+## Handle descendant timeout
+
+First inspect the reported process group and log without changing them:
+
+```bash
+ps -o pid,ppid,stat,etime,command -g <pgid>
+python3 <skill-directory>/scripts/pulse.py extract --log <log-path>
+```
+
+Decide from that evidence whether the descendants are expected work, stuck work, or an unwanted background service. Continue low-frequency inspection when work is expected. Terminate the exact reported process group only when that action is within the task scope; the wrapper does not make that decision automatically.
