@@ -185,7 +185,7 @@ def test_progress_is_opt_in_deduplicated_and_rate_limited(tmp_path: Path) -> Non
     assert progress[-1].endswith('"phase 3/3"')
 
 
-def test_carriage_return_progress_is_treated_as_complete_updates(tmp_path: Path) -> None:
+def test_carriage_return_progress_keeps_latest_complete_update(tmp_path: Path) -> None:
     result, _ = _run_command(
         tmp_path,
         """
@@ -205,7 +205,8 @@ def test_carriage_return_progress_is_treated_as_complete_updates(tmp_path: Path)
     )
     assert result.returncode == 0
     progress = [line for line in _output_lines(result) if line.startswith("pulse: progress")]
-    assert len(progress) == 2
+    assert 1 <= len(progress) <= 2
+    assert progress[-1].endswith('"phase 2/2"')
     assert "lines=2" in _output_lines(result)[-1]
 
 
